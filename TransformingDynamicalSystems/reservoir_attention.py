@@ -3,17 +3,23 @@ import torch.nn as nn
 from echotorch.nn import LiESN
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, d_obs, d_model, num_heads, enc_num_layers, enc_dropout):
+    def __init__(self, seq_len, d_obs, d_model, num_heads, enc_num_layers, enc_dropout, esn):
         super(TransformerEncoder, self).__init__()
         self.input_layer = nn.Linear(d_obs, d_model)
-        self.pe_layer = PositionalEncoding(d_model, max_len=5000)
+        self.pe_layer = PositionalEncoding(d_model, seq_len)
+        self.esn = esn
         encoder_layer = nn.TransformerEncoderLayer(d_model, num_heads, dropout=enc_dropout, batch_first=True)
         self.encoder_layers = nn.TransformerEncoder(encoder_layer, num_layers=enc_num_layers)
 
-    def forward(self, enc_input):
-        x = self.input_layer(enc_input)
-        x = self.pe_layer(x)
-        enc_output = self.encoder_layers(x)
+    def forward(self, enc_input: torch.Tensor) -> torch.Tensor:
+        int_input = self.input_layer(enc_input)
+        int_input = self.pe_layer(int_input)
+        
+        # ESN に入力
+        esn_output = self.esn(int_input)
+        
+        # エンコーダレイヤーに入力
+        enc_output = self.encoder_layers(esn_output)
         return enc_output
 
 class TransformerDecoder(nn.Module):
@@ -31,14 +37,10 @@ class TransformerDecoder(nn.Module):
         return dec_output
 
 class ReservoirWithAttention(nn.Module):
-    def __init__(self, d_obs, d_model, num_heads, enc_num_layers, dec_num_layers, enc_dropout, dec_dropout, esn):
+    def __init__(self, seq_len, d_obs, d_model, num_heads, enc_num_layers, dec_num_layers, enc_dropout, dec_dropout, esn):
         super(ReservoirWithAttention, self).__init__()
-        self.encoder = TransformerEncoder(d_obs, d_model, num_heads, enc_num_layers, enc_dropout)
+        self.encoder = TransformerEncoder(seq_len, d_obs, d_model, num_heads, enc_num_layers, enc_dropout, esn)
         self.decoder = TransformerDecoder(d_obs, d_model, num_heads, dec_num_layers, dec_dropout)
-        self.esn = esn
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -49,26 +51,18 @@ class ReservoirWithAttention(nn.Module):
         # Transformerエンコーダの出力を取得
         enc_output = self.encoder(enc_input)
         
-        # ESN の forward メソッドを呼び出して内部状態を更新
-        hidden_states, _ = self.esn(enc_output)  # ESN の forward メソッドを呼び出して隠れ状態を取得
-        
-        # 正規化と注意機構の適用
-        x = self.norm1(hidden_states)
-        attn_out, _ = self.attention(x, x, x)
-        x = self.norm2(attn_out + x)
-        
         # Transformerデコーダの出力を取得
-        dec_output = self.decoder(dec_input, x, enc_mask, dec_mask)
+        dec_output = self.decoder(dec_input, enc_output, enc_mask, dec_mask)
         
         # MLPを通して最終出力を取得
-        output = self.mlp(dec_output)
-        return output
+        # output = self.mlp(dec_output)
+        return dec_output
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+    def __init__(self, d_model, seq_len):
         super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        pe = torch.zeros(seq_len, d_model)
+        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -78,7 +72,6 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         x = x + self.pe[:x.size(0), :]
         return x
-
 
 
 # import torch

@@ -1,109 +1,82 @@
-import torch.nn as nn
 import torch
+import torch.nn as nn
+from echotorch.nn import LiESN
 
+class TransformerEncoder(nn.Module):
+    def __init__(self, seq_len, d_obs, d_model, num_heads, enc_num_layers, enc_dropout, esn):
+        super(TransformerEncoder, self).__init__()
+        self.input_layer = nn.Linear(d_obs, d_model)
+        self.pe_layer = PositionalEncoding(d_model, seq_len)
+        self.esn = esn
+        encoder_layer = nn.TransformerEncoderLayer(d_model, num_heads, dropout=enc_dropout, batch_first=True)
+        self.encoder_layers = nn.TransformerEncoder(encoder_layer, num_layers=enc_num_layers)
 
-# data shape: (batch, sequence_len, d_model)
+    def forward(self, enc_input: torch.Tensor) -> torch.Tensor:
+        int_input = self.input_layer(enc_input)
+        int_input = self.pe_layer(int_input)
+        
+        # ESN に入力
+        esn_output = self.esn(int_input)
+        
+        # エンコーダレイヤーに入力
+        enc_output = self.encoder_layers(esn_output)
+        return enc_output
 
-class TransformerModel(nn.Module):
-    def __init__(
-        self,
-        seq_len: int,
-        d_obs: int,
-        d_model: int,
-        num_heads: int,
-        enc_num_layers: int,
-        dec_num_layers: int,
-        enc_dropout: float = 0.2,
-        dec_dropout: float = 0.2,
-    ) -> None:
-        super().__init__()
-        self.encoder = self.TransformerEncoder(
-            seq_len, d_obs, d_model, num_heads, enc_num_layers, enc_dropout
-        )
-        self.decoder = self.TransformerDecoder(
-            d_obs, d_model, num_heads, dec_num_layers, dec_dropout
-        )
+class TransformerDecoder(nn.Module):
+    def __init__(self, d_obs, d_model, num_heads, dec_num_layers, dec_dropout):
+        super(TransformerDecoder, self).__init__()
+        self.input_layer = nn.Linear(d_obs, d_model)
+        decoder_layer = nn.TransformerDecoderLayer(d_model, num_heads, dropout=dec_dropout, batch_first=True)
+        self.decoder_layers = nn.TransformerDecoder(decoder_layer, num_layers=dec_num_layers)
+        self.output_layer = nn.Linear(d_model, d_obs)
 
-    def forward(self, enc_input: torch.Tensor, dec_input: torch.Tensor,
-                enc_mask: torch.Tensor, dec_mask: torch.Tensor) -> torch.Tensor:
-
-        enc_output = self.encoder(enc_input)
-        dec_output = self.decoder(dec_input, enc_output, enc_mask, dec_mask)
+    def forward(self, dec_input, enc_output, enc_mask, dec_mask):
+        x = self.input_layer(dec_input)
+        x = self.decoder_layers(tgt=x, memory=enc_output, tgt_mask=dec_mask, memory_mask=enc_mask)
+        dec_output = self.output_layer(x)
         return dec_output
 
-    class TransformerEncoder(nn.Module):
-        def __init__(
-            self,
-            seq_len: int,
-            d_obs: int,
-            d_model: int,
-            num_heads: int,
-            enc_num_layers: int,
-            enc_dropout: float,
-        ) -> None:
-            super().__init__()
+class ReservoirWithAttention(nn.Module):
+    def __init__(self, seq_len, d_obs, d_model, num_heads, enc_num_layers, dec_num_layers, enc_dropout, dec_dropout, esn):
+        super(ReservoirWithAttention, self).__init__()
+        self.encoder = TransformerEncoder(seq_len, d_obs, d_model, num_heads, enc_num_layers, enc_dropout, esn)
+        self.decoder = TransformerDecoder(d_obs, d_model, num_heads, dec_num_layers, dec_dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_obs)
+        )
 
-            self.input_layer = nn.Linear(in_features=d_obs, out_features=d_model)
-            self.pe_layer = PositionalEncoding(d_model=d_model, seq_len=seq_len)
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model, nhead=num_heads, dropout=enc_dropout, batch_first=True
-            )
-            self.encoder_layers = nn.TransformerEncoder(
-                encoder_layer=encoder_layer, num_layers=enc_num_layers
-            )
-
-        def forward(self, enc_input: torch.Tensor) -> torch.Tensor:
-
-            int_input = self.input_layer(enc_input)
-            int_input = self.pe_layer(int_input)
-            enc_output = self.encoder_layers(int_input)
-            return enc_output
-
-    class TransformerDecoder(nn.Module):
-        def __init__(
-            self,
-            d_obs: int,
-            d_model: int,
-            num_heads: int,
-            dec_num_layers: int,
-            dec_dropout: float,
-        ) -> None:
-            super().__init__()
-
-            self.input_layer = nn.Linear(in_features=d_obs, out_features=d_model)
-            decoder_layer = nn.TransformerDecoderLayer(
-                d_model=d_model, nhead=num_heads, dropout=dec_dropout, batch_first=True
-            )
-            self.decoder_layers = nn.TransformerDecoder(
-                decoder_layer=decoder_layer, num_layers=dec_num_layers
-            )
-            self.output_layer = nn.Linear(in_features=d_model, out_features=d_obs)
-
-        def forward(self, dec_input: torch.Tensor, enc_output: torch.Tensor,
-                    enc_mask: torch.Tensor, dec_mask: torch.Tensor) -> torch.Tensor:
-
-            int_input = self.input_layer(dec_input)
-            int_output = self.decoder_layers(
-                tgt=int_input,
-                tgt_mask=dec_mask,
-                memory=enc_output,
-                memory_mask=enc_mask,
-            )
-            dec_output = self.output_layer(int_output)
-            return dec_output
-
+    def forward(self, enc_input, dec_input, enc_mask, dec_mask):
+        # Transformerエンコーダの出力を取得
+        enc_output = self.encoder(enc_input)
+        
+        # 正規化と注意機構の適用
+        x = self.norm1(enc_output)
+        attn_out, _ = self.attention(x, x, x)
+        x = self.norm2(attn_out + x)
+        
+        # Transformerデコーダの出力を取得
+        dec_output = self.decoder(dec_input, x, enc_mask, dec_mask)
+        
+        # MLPを通して最終出力を取得
+        output = self.mlp(dec_output)
+        return output
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, seq_len: int) -> None:
-        super().__init__()
+    def __init__(self, d_model, seq_len):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(seq_len, d_model)
+        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
 
-        p_pos = torch.arange(0, seq_len).unsqueeze(1)
-        p_i = torch.arange(0, d_model)
-
-        PE = (p_pos / (1000**(2*p_i/d_model))).unsqueeze(0)
-        PE[0, :, 0::2] = torch.sin(PE[:, :, 0::2])
-        PE[0, :, 1::2] = torch.cos(PE[:, :, 1::2])
-        self.PE = PE
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.PE[:, :x.shape[1], :]
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return x
